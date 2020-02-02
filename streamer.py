@@ -4,6 +4,8 @@ from lossy_socket import LossyUDP
 from socket import INADDR_ANY
 
 import struct
+import concurrent.futures
+import time
 
 class Streamer:
     def __init__(self, dst_ip, dst_port,
@@ -23,6 +25,8 @@ class Streamer:
         self.receiveBuffer = {} # key is sequence number, value is body bytes
         self.ack = 0 # expecting body from
 
+        self.executor = concurrent.futures.ThreadPoolExecutor()
+
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
         # Your code goes here!  The code below should be changed!
@@ -40,23 +44,34 @@ class Streamer:
             self.seq += len(body)
             self.sendBuffer[self.seq] = body
 
-            while True:
-                self.recvIntoBuffer()
-                if self.seq in self.sendBuffer:
-                    self.retransmit(self.seq)
-                else:
-                    break
+            self.asyncTraceSegment(self.seq)
+            # self.executor.submit(self.asyncTraceSegment, self.seq)
+
+    def asyncTraceSegment(self, ack: int) -> None:
+        job = self.executor.submit(self.recvIntoBuffer)
+
+        while True:
+            time.sleep(0.25)
+            if ack in self.sendBuffer:
+                body = self.sendBuffer[ack]
+                self.sendSegment(ack - len(body), self.ack, body)
+                if job.done():
+                    job = self.executor.submit(self.recvIntoBuffer)
+            else:
+                print("acked", ack)
+                break
 
     def recvIntoBuffer(self) -> None:
         data, addr = self.socket.recvfrom()
         header = data[: 8]
         body = data[8: ]
         seq, ack = struct.unpack(">ll", header)
+        # sender side
         if body: # a data + ack
-            print("data segment", seq, ack)
+            print("data segment", seq, ack, body, time.time())
             if seq == self.ack: # in order, normal situation
                 self.receiveBuffer[seq] = body # put in buffer
-                self.ack += len(body) # expecting next body
+                self.ack = seq + len(body) # expecting next body
                 self.sendAck(self.seq, self.ack)
             elif seq > self.ack: # out of order, latter comes first
                 self.receiveBuffer[seq] = body # put in buffer
@@ -72,32 +87,45 @@ class Streamer:
                         break
 
                 if complete:
-                    self.ack += len(body)
+                    self.ack = seq + len(body)
                     self.sendAck(self.seq, self.ack)
                 else:
-                    self.sendAck(self.seq, self.ack)
+                    print("incomplete")
+                    self.sendAck(self.seq, seek)
             else: # seq < self.ack
                 self.sendAck(self.seq, self.ack)
         else: # an ack
-            print("ack", seq, ack)
+            print("acked", seq, ack, time.time())
             pass
 
+        # receiver side
         if ack == self.seq: # receiver gets all, normal situation
             self.sendBuffer.clear()
-        elif ack < self.seq: # receiver gets partial
+        elif ack < self.seq: # receiver gets partial, retransmit un-acked data
 
-            for k, v in self.sendBuffer:
-                if k - len(v) >= ack:
-                    self.sendSegment(k - len(v), self.ack, v)
+            toPop = []
+
+            for k, v in self.sendBuffer.items():
+                # if k - len(v) >= ack:
+                #     self.sendSegment(k - len(v), self.ack, v)
+                # else:
+                #     toPop.append(k)
+                if k <= ack:
+                    toPop.append(k)
+                else: # no need to retransmit here, because traceSegment() will take care of it
+                    pass
+
+            for k in toPop:
+                self.sendBuffer.pop(k)
 
         else: # ack > self.seq not possible
-            pass
+            self.sendBuffer.clear()
 
     def sendAck(self, seq: int, ack: int) -> None:
         self.sendSegment(seq, ack)
 
     def sendSegment(self, seq: int, ack: int, body: bytes=b"") -> None:
-        print("sent", seq, ack, body)
+        print("sent", seq, ack, body, time.time())
         header = struct.pack(">ll", seq, ack)
         segment = header + body
         self.socket.sendto(segment, (self.dst_ip, self.dst_port))
