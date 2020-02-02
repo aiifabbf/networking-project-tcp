@@ -15,9 +15,13 @@ class Streamer:
         self.dst_ip = dst_ip
         self.dst_port = dst_port
 
+        self.seek = 0 # expect to receive body from
+
+        self.sendBuffer = {} # key is ack number, value is body bytes
+        self.seq = 0 # sending body from
+
         self.receiveBuffer = {} # key is sequence number, value is body bytes
-        self.expectingSequenceNumber = 0 # expect to receive body from
-        self.sequenceNumber = 0 # sending body from
+        self.ack = 0 # expecting body from
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
@@ -25,15 +29,78 @@ class Streamer:
 
         # for now I'm just sending the raw application-level data in one UDP payload
         segmentSize = 1472
-        headerSize = 64
+        headerSize = 8
         bodySize = segmentSize - headerSize
 
         for i in range(0, len(data_bytes), bodySize):
             body = data_bytes[i: i + bodySize]
-            header = struct.pack(">l", self.sequenceNumber)
+            header = struct.pack(">ll", self.seq, self.ack)
             segment = header + body
             self.socket.sendto(segment, (self.dst_ip, self.dst_port))
-            self.sequenceNumber += len(body)
+            self.seq += len(body)
+            self.sendBuffer[self.seq] = body
+
+            while True:
+                self.recvIntoBuffer()
+                if self.seq in self.sendBuffer:
+                    self.retransmit(self.seq)
+                else:
+                    break
+
+    def recvIntoBuffer(self) -> None:
+        data, addr = self.socket.recvfrom()
+        header = data[: 8]
+        body = data[8: ]
+        seq, ack = struct.unpack(">ll", header)
+        if body: # a data + ack
+            print("data segment", seq, ack)
+            if seq == self.ack: # in order, normal situation
+                self.receiveBuffer[seq] = body # put in buffer
+                self.ack += len(body) # expecting next body
+                self.sendAck(self.seq, self.ack)
+            elif seq > self.ack: # out of order, latter comes first
+                self.receiveBuffer[seq] = body # put in buffer
+
+                seek = self.ack
+                complete = True
+
+                while seek != seq:
+                    if seek in self.receiveBuffer:
+                        seek += len(self.receiveBuffer[seek])
+                    else:
+                        complete = False
+                        break
+
+                if complete:
+                    self.ack += len(body)
+                    self.sendAck(self.seq, self.ack)
+                else:
+                    self.sendAck(self.seq, self.ack)
+            else: # seq < self.ack
+                self.sendAck(self.seq, self.ack)
+        else: # an ack
+            print("ack", seq, ack)
+            pass
+
+        if ack == self.seq: # receiver gets all, normal situation
+            self.sendBuffer.clear()
+        elif ack < self.seq: # receiver gets partial
+
+            for k, v in self.sendBuffer:
+                if k - len(v) >= ack:
+                    self.sendSegment(k - len(v), self.ack, v)
+
+        else: # ack > self.seq not possible
+            pass
+
+    def sendAck(self, seq: int, ack: int) -> None:
+        self.sendSegment(seq, ack)
+
+    def sendSegment(self, seq: int, ack: int, body: bytes=b"") -> None:
+        print("sent", seq, ack, body)
+        header = struct.pack(">ll", seq, ack)
+        segment = header + body
+        self.socket.sendto(segment, (self.dst_ip, self.dst_port))
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
@@ -41,16 +108,12 @@ class Streamer:
         
         # this sample code just calls the recvfrom method on the LossySocket
         while True:
-            if self.expectingSequenceNumber in self.receiveBuffer: # if requested segment has already arrived
-                res = self.receiveBuffer.pop(self.expectingSequenceNumber)
-                self.expectingSequenceNumber += len(res)
+            if self.seek in self.receiveBuffer: # if requested segment has already arrived
+                res = self.receiveBuffer.pop(self.seek)
+                self.seek += len(res)
                 break # feed body to upper layer immediately
             else: # if not arrived yet, wait
-                data, addr = self.socket.recvfrom()
-                header = data[: 4]
-                body = data[4: ]
-                sequenceNumber = struct.unpack(">l", header)[0]
-                self.receiveBuffer[sequenceNumber] = body # put in buffer
+                self.recvIntoBuffer()
 
         return res
         # For now, I'll just pass the full UDP payload to the app
