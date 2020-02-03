@@ -27,7 +27,11 @@ class Streamer:
 
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self.executor.submit(self.inBoundWorker) # start background worker
-        # self.executor.submit(self.outBoundWorker)
+        self.executor.submit(self.outBoundWorker)
+
+        self.localFinAckedByRemote = False
+        self.remoteFinSignal = False
+        self.remoteFin = False
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
@@ -45,11 +49,12 @@ class Streamer:
             self.seq += len(body)
 
         job = self.executor.submit(self.waitForAck)
-        job.result()
+        # job.result()
 
     def waitForAck(self) -> None:
 
         while True:
+            time.sleep(0.25)
             if self.sendBuffer: # receiver did not acked every segments we sent
 
                 for k in sorted(self.sendBuffer.keys()): # resend everything in the send buffer
@@ -63,6 +68,11 @@ class Streamer:
 
         while True:
             self.recvIntoBuffer()
+
+            if self.remoteFinSignal:
+                print("< finack")
+                self.sendSegment(self.seq, self.ack, control=b"finack")
+                self.remoteFinSignal = False
 
     def outBoundWorker(self) -> None:
 
@@ -121,6 +131,15 @@ class Streamer:
         else: # ack > self.seq, receiver acked some segments we have not sent
             self.sendBuffer.clear()
 
+        if control == b"fin": # remote wants to fin
+            print("> fin")
+            self.remoteFinSignal = True
+            self.remoteFin = True
+
+        if control == b"finack": # remote has received our fin
+            print("> finack")
+            self.localFinAckedByRemote = True
+
     def sendAck(self, seq: int, ack: int) -> None:
         self.sendSegment(seq, ack)
 
@@ -165,10 +184,18 @@ class Streamer:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
-        while self.sendBuffer: # just wait until send buffer gets empty
-            # print(self.sendBuffer)
-            pass
+        start = time.time()
 
+        while not self.localFinAckedByRemote and time.time() - start < 0.5:
+            print("< fin")
+            time.sleep(0.1)
+            self.sendSegment(self.seq, self.ack, control=b"fin")
+
+        start = time.time()
+
+        while not self.remoteFin and time.time() - start < 0.5:
+            pass
+        
         # while not self.remoteFin:
         #     pass
         self.socket.stoprecv()
