@@ -30,6 +30,7 @@ class Streamer:
         self.pullRemoteSeek = 0 # remote has written until
 
         self.maxInFlightSegmentCount = 4
+        self.lastEchoTimeStamp = 0
 
         self.lock = threading.Lock()
 
@@ -59,7 +60,7 @@ class Streamer:
     def outBoundWorker(self) -> None:
 
         while not self.closed:
-            time.sleep(0.1) # every some time you should send something. If there is data, send data. If there is no data, send a heartbeat
+            time.sleep(0.25) # every some time you should send something. If there is data, send data. If there is no data, send a heartbeat
 
             with self.lock:
                 if self.pushRemoteSeek < self.pushLocalSeek: # receiver did not acked every segments we sent
@@ -104,12 +105,12 @@ class Streamer:
 
     def recvIntoBuffer(self) -> bool: # just receive data, update self.ack and send buffer
         data, addr = self.socket.recvfrom() # decode segment
-        self.lastMessageTimestamp = time.time()
 
         if not data:
             return False
 
         self.lock.acquire()
+        self.lastEchoTimeStamp = time.time()
 
         try:
             decoded = self.decodeSegment(data)
@@ -210,25 +211,28 @@ class Streamer:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
-        self.lock.acquire()
-        if self.pushRemoteSeek < self.pushLocalSeek:
-            self.lock.release()
+        while True:
 
-            try:
-                self.outBoundJob.result(3)
-            except concurrent.futures.TimeoutError:
-                pass
+            with self.lock:
+                unsynced = self.pushLocalSeek != self.pushRemoteSeek or self.pullLocalSeek != self.pullRemoteSeek
+                makingProgress = (time.time() - self.lastEchoTimeStamp) < 3
+                # print("pull local seek:", self.pullLocalSeek)
+                # print("pull remote seek:", self.pullRemoteSeek)
+                # print("push local seek:", self.pushLocalSeek)
+                # print("push remote seek:", self.pushRemoteSeek)
 
-        else:
-            self.lock.release()
+            if unsynced and makingProgress:
+                time.sleep(0.1)
+            else:
+                break
 
         self.socket.stoprecv()
         self.closed = True
 
-        print("pull buffer size:", len(self.pullBuffer))
-        print("push buffer size:", len(self.pushBuffer))
-        print("---")
-        print("pull local seek:", self.pullLocalSeek)
-        print("pull remote seek:", self.pullRemoteSeek)
-        print("push local seek:", self.pushLocalSeek)
-        print("push remote seek:", self.pushRemoteSeek)
+        # print("pull buffer size:", len(self.pullBuffer))
+        # print("push buffer size:", len(self.pushBuffer))
+        # print("---")
+        # print("pull local seek:", self.pullLocalSeek)
+        # print("pull remote seek:", self.pullRemoteSeek)
+        # print("push local seek:", self.pushLocalSeek)
+        # print("push remote seek:", self.pushRemoteSeek)
