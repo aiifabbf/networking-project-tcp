@@ -25,7 +25,9 @@ class Streamer:
         self.receiveBuffer = {} # key is sequence number, value is body bytes
         self.ack = 0 # expecting body from
 
-        self.executor = concurrent.futures.ThreadPoolExecutor()
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self.executor.submit(self.inBoundWorker) # start background worker
+        # self.executor.submit(self.outBoundWorker)
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
@@ -33,14 +35,12 @@ class Streamer:
 
         # for now I'm just sending the raw application-level data in one UDP payload
         segmentSize = 1472
-        headerSize = 8
+        headerSize = 16
         bodySize = segmentSize - headerSize
 
         for i in range(0, len(data_bytes), bodySize):
             body = data_bytes[i: i + bodySize]
-            header = struct.pack(">ll", self.seq, self.ack)
-            segment = header + body
-            self.socket.sendto(segment, (self.dst_ip, self.dst_port))
+            self.sendSegment(self.seq, self.ack, body)
             self.sendBuffer[self.seq] = body
             self.seq += len(body)
 
@@ -50,7 +50,6 @@ class Streamer:
     def waitForAck(self) -> None:
 
         while True:
-            self.recvIntoBuffer()
             if self.sendBuffer: # receiver did not acked every segments we sent
 
                 for k in sorted(self.sendBuffer.keys()): # resend everything in the send buffer
@@ -60,11 +59,26 @@ class Streamer:
             else:
                 break
 
+    def inBoundWorker(self) -> None: # background worker
+
+        while True:
+            self.recvIntoBuffer()
+
+    def outBoundWorker(self) -> None:
+
+        while True:
+            time.sleep(0.25)
+            # print("< heartbeat", self.seq, self.ack)
+            self.sendAck(self.seq, self.ack)
+
     def recvIntoBuffer(self) -> None: # just receive data, update self.ack and send buffer
         data, addr = self.socket.recvfrom() # decode segment
-        header = data[: 8]
-        body = data[8: ]
-        seq, ack = struct.unpack(">ll", header)
+        decoded = self.decodeSegment(data)
+        seq = decoded["seq"]
+        ack = decoded["ack"]
+        control = decoded["control"]
+        body = decoded["body"]
+        # print(">", seq, ack, body)
 
         # receiver side
         if body: # contains data
@@ -88,6 +102,7 @@ class Streamer:
                 pass
         else: # no data, just ack
             pass
+            # print("> heartbeat", seq, ack)
         
         # sender side
         if ack == self.seq: # receiver acked all segments we sent
@@ -104,15 +119,29 @@ class Streamer:
                 self.sendBuffer.pop(k) # clear segments already acked
 
         else: # ack > self.seq, receiver acked some segments we have not sent
-            pass
+            self.sendBuffer.clear()
 
     def sendAck(self, seq: int, ack: int) -> None:
         self.sendSegment(seq, ack)
 
-    def sendSegment(self, seq: int, ack: int, body: bytes=b"") -> None:
-        header = struct.pack(">ll", seq, ack)
+    def sendSegment(self, seq: int, ack: int, body: bytes=b"", control: bytes=b"") -> None:
+        # print("<", seq, ack, body)
+        control = control.rjust(8, b" ") # pad to 8 bytes
+        header = struct.pack(">ll", seq, ack) + control
         segment = header + body
         self.socket.sendto(segment, (self.dst_ip, self.dst_port))
+
+    def decodeSegment(self, data: bytes=b"") -> dict:
+        seqack = data[: 8]
+        control = data[8: 16]
+        body = data[16: ]
+        seq, ack = struct.unpack(">ll", seqack)
+        return {
+            "seq": seq,
+            "ack": ack,
+            "control": control.strip(),
+            "body": body,
+        }
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
@@ -136,6 +165,12 @@ class Streamer:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
-        self.sendAck(self.seq, self.ack)
+        while self.sendBuffer: # just wait until send buffer gets empty
+            # print(self.sendBuffer)
+            pass
+
+        # while not self.remoteFin:
+        #     pass
         self.socket.stoprecv()
+        self.executor.shutdown(False)
         pass
