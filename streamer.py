@@ -5,6 +5,7 @@ from socket import INADDR_ANY
 
 import struct
 import threading
+import concurrent.futures
 import time
 
 class Streamer:
@@ -19,22 +20,25 @@ class Streamer:
 
         self.seek = 0 # expect to receive body from
 
-        self.sendBuffer = {} # key is sequence number, value is body bytes
-        self.seq = 0 # sending body from
+        self.pushBuffer = {} # key is sequence number, value is body bytes
+        self.pushLocalSeek = 0
+        self.pushRemoteSeek = 0
 
-        self.receiveBuffer = {} # key is sequence number, value is body bytes
-        self.ack = 0 # expecting body from
+        self.pullBuffer = {} # key is sequence number, value is body bytes
+        self.pullLocalSeek = 0 # expecting body from
+        self.pullRemoteSeek = 0
 
-        self.localFinAckedByRemote = False
-        self.remoteFinSignal = False
-        self.remoteFin = False
+        self.pushMaxDelta = 1000
 
         self.lock = threading.Lock()
 
         self.closed = False
 
-        threading.Thread(target=self.inBoundWorker).start()
-        threading.Thread(target=self.outBoundWorker).start()
+        self.executor = concurrent.futures.ThreadPoolExecutor()
+
+        self.waitForAckJob = self.executor.submit(self.waitForAck)
+        self.inBoundJob = self.executor.submit(self.inBoundWorker)
+        self.watchdogJob = self.executor.submit(self.watchdogWorker)
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
@@ -45,26 +49,53 @@ class Streamer:
         headerSize = 16
         bodySize = segmentSize - headerSize
 
-        for i in range(0, len(data_bytes), bodySize):
-            body = data_bytes[i: i + bodySize]
-            self.sendSegment(self.seq, self.ack, body)
-            self.sendBuffer[self.seq] = body
-            self.seq += len(body)
+        if self.waitForAckJob.running():
+            if self.pushLocalSeek - self.pushRemoteSeek > self.pushMaxDelta:
+                self.waitForAckJob.result()
+            else:
 
-        # threading.Thread(target=self.waitForAck).start()
-        self.waitForAck()
+                for i in range(0, len(data_bytes), bodySize):
+                    body = data_bytes[i: i + bodySize]
+
+                    with self.lock:
+                        self.sendSegment(self.pushLocalSeek, self.pullLocalSeek, body)
+                        self.pushBuffer[self.pushLocalSeek] = body
+                        self.pushLocalSeek += len(body)
+
+        elif self.waitForAckJob.done():
+
+            for i in range(0, len(data_bytes), bodySize):
+                body = data_bytes[i: i + bodySize]
+
+                with self.lock:
+                    self.sendSegment(self.pushLocalSeek, self.pullLocalSeek, body)
+                    self.pushBuffer[self.pushLocalSeek] = body
+                    self.pushLocalSeek += len(body)
+
+            self.waitForAckJob = self.executor.submit(self.waitForAck)
+
+        else:
+
+            for i in range(0, len(data_bytes), bodySize):
+                body = data_bytes[i: i + bodySize]
+
+                with self.lock:
+                    self.sendSegment(self.pushLocalSeek, self.pullLocalSeek, body)
+                    self.pushBuffer[self.pushLocalSeek] = body
+                    self.pushLocalSeek += len(body)
 
     def waitForAck(self) -> None:
 
-        while True:
+        while not self.closed:
             time.sleep(0.25)
 
             with self.lock:
-                if self.sendBuffer: # receiver did not acked every segments we sent
+                if self.pushRemoteSeek < self.pushLocalSeek: # receiver did not acked every segments we sent
 
-                    for k in sorted(self.sendBuffer.keys()): # resend everything in the send buffer
-                        v = self.sendBuffer[k]
-                        self.sendSegment(k, self.ack, v)
+                    for k in sorted(self.pushBuffer.keys()): # resend everything in the send buffer
+                        v = self.pushBuffer[k]
+                        if k >= self.pushRemoteSeek:
+                            self.sendSegment(k, self.pullLocalSeek, v)
 
                 else:
                     break
@@ -72,23 +103,30 @@ class Streamer:
     def inBoundWorker(self) -> None: # background worker
 
         while not self.closed:
-            self.recvIntoBuffer()
+            if self.recvIntoBuffer():
+                continue
+            else:
+                break
 
-            with self.lock:
-                if self.remoteFinSignal:
-                    self.sendSegment(self.seq, self.ack, control=b"finack")
-                    self.remoteFinSignal = False
-
-    def outBoundWorker(self) -> None:
+    def watchdogWorker(self) -> None:
 
         while not self.closed:
-            time.sleep(0.25)
-            with self.lock:
-                # print("< heartbeat", self.seq, self.ack)
-                self.sendAck(self.seq, self.ack)
+            time.sleep(0.5)
+            self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
 
-    def recvIntoBuffer(self) -> None: # just receive data, update self.ack and send buffer
+            print("pull local seek:", self.pullLocalSeek)
+            print("pull remote seek:", self.pullRemoteSeek)
+            print("push local seek:", self.pushLocalSeek)
+            print("push remote seek:", self.pushRemoteSeek)
+            print("pull buffer size:", len(self.pullBuffer))
+            print("push buffer size:", len(self.pushBuffer))
+
+    def recvIntoBuffer(self) -> bool: # just receive data, update self.ack and send buffer
         data, addr = self.socket.recvfrom() # decode segment
+        self.lastMessageTimestamp = time.time()
+
+        if not data:
+            return False
 
         self.lock.acquire()
 
@@ -97,65 +135,51 @@ class Streamer:
         ack = decoded["ack"]
         control = decoded["control"]
         body = decoded["body"]
-        print(">", seq, ack, control, body)
+        # print(">", seq, ack, control, body)
 
-        # receiver side
-        if body: # contains data
-            if seq == self.ack: # normal condition, in order
-                self.receiveBuffer[seq] = body
-                self.ack = seq + len(body)
-            elif seq > self.ack: # out of order
-                self.receiveBuffer[seq] = body
+        self.pullRemoteSeek = max(self.pullRemoteSeek, seq)
+        self.pushRemoteSeek = max(self.pushRemoteSeek, ack)
 
-                # ack frontmost continuous buffer
-                seek = self.ack
+        if body:
+            self.pullBuffer[seq] = body
 
-                while seek != seq:
-                    if seek in self.receiveBuffer:
-                        seek += len(self.receiveBuffer[seek])
-                    else:
+            if self.pullLocalSeek == self.pullRemoteSeek:
+                self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
+            elif self.pullLocalSeek < self.pullRemoteSeek:
+
+                seek = self.pullLocalSeek
+
+                while True:
+                    if seek not in self.pullBuffer:
                         break
+                    else:
+                        seek += len(self.pullBuffer[seek])
 
-                self.ack = seek
-            else: # seq < self.ack, sender sent something that we already have
+                self.pullLocalSeek = seek
+                self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
+            else:
                 pass
-        else: # no data, just ack
+        else: # no data
             pass
-            # print("> heartbeat", seq, ack)
-        
-        # sender side
-        if ack == self.seq: # receiver acked all segments we sent
-            self.sendBuffer.clear() # clear send buffer
-        elif ack < self.seq: # receiver acked some segments we sent
 
-            toPop = []
+        toPop = []
 
-            for k, v in self.sendBuffer.items():
-                if k + len(v) <= ack:
-                    toPop.append(k)
+        for k, v in self.pushBuffer.items():
+            if k + len(v) <= self.pushRemoteSeek:
+                toPop.append(k)
 
-            for k in toPop:
-                self.sendBuffer.pop(k) # clear segments already acked
-
-        else: # ack > self.seq, receiver acked some segments we have not sent
-            self.sendBuffer.clear()
-
-        if control == b"fin": # remote wants to fin
-            print("> fin")
-            self.remoteFinSignal = True
-            self.remoteFin = True
-
-        if control == b"finack": # remote has received our fin
-            print("> finack")
-            self.localFinAckedByRemote = True
+        for k in toPop:
+            self.pushBuffer.pop(k)
 
         self.lock.release()
+
+        return True
 
     def sendAck(self, seq: int, ack: int) -> None:
         self.sendSegment(seq, ack)
 
     def sendSegment(self, seq: int, ack: int, body: bytes=b"", control: bytes=b"") -> None:
-        print("<", seq, ack, control, body)
+        # print("<", seq, ack, control, body)
         control = control.rjust(8, b" ") # pad to 8 bytes
         header = struct.pack(">ll", seq, ack) + control
         segment = header + body
@@ -179,14 +203,12 @@ class Streamer:
         
         # this sample code just calls the recvfrom method on the LossySocket
         while True:
-            if self.seek in self.receiveBuffer: # if requested segment has already arrived
-                res = self.receiveBuffer.pop(self.seek)
+            if self.seek in self.pullBuffer: # if requested segment has already arrived
+                res = self.pullBuffer.pop(self.seek)
                 self.seek += len(res)
-                self.sendAck(self.seq, self.ack)
                 break # feed body to upper layer immediately
             else: # if not arrived yet, wait
                 self.recvIntoBuffer()
-                self.sendAck(self.seq, self.ack)
 
         return res
         # For now, I'll just pass the full UDP payload to the app
@@ -195,31 +217,33 @@ class Streamer:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
-        start = time.time()
+        print("1")
 
-        while True:
+        try:
+            if self.waitForAckJob.running():
+                print("2")
+                self.waitForAckJob.result(3)
+                print("3")
+            elif self.waitForAckJob.done():
+                print("4")
+                if self.pushRemoteSeek < self.pushLocalSeek:
+                    print("5")
+                    self.waitForAckJob = self.executor.submit(self.waitForAck)
+                    print("6")
+                    self.waitForAckJob.result(3)
+                    print("7")
+            else:
+                print("8")
+                self.waitForAckJob.result(3)
+                print("9")
+        except concurrent.futures.TimeoutError:
+            pass
 
-            with self.lock:
-                if not self.localFinAckedByRemote and time.time() - start < 0.5:
-                    time.sleep(0.1)
-                    self.sendSegment(self.seq, self.ack, control=b"fin")
-                else:
-                    break
+        self.socket.stoprecv()
+        self.closed = True
+        print("10")
 
-        start = time.time()
-
-        while True:
-
-            with self.lock:
-                if not self.remoteFin and time.time() - start < 0.5:
-                    pass
-                else:
-                    break
-        
-        with self.lock:
-            self.closed = True
-
-        # while not self.remoteFin:
-        #     pass
-        # self.socket.stoprecv()
-        pass
+        print("pull local seek:", self.pullLocalSeek)
+        print("pull remote seek:", self.pullRemoteSeek)
+        print("push local seek:", self.pushLocalSeek)
+        print("push remote seek:", self.pushRemoteSeek)
