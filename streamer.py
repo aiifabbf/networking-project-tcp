@@ -19,7 +19,7 @@ class Streamer:
 
         self.seek = 0 # expect to receive body from
 
-        self.sendBuffer = {} # key is ack number, value is body bytes
+        self.sendBuffer = {} # key is sequence number, value is body bytes
         self.seq = 0 # sending body from
 
         self.receiveBuffer = {} # key is sequence number, value is body bytes
@@ -41,91 +41,75 @@ class Streamer:
             header = struct.pack(">ll", self.seq, self.ack)
             segment = header + body
             self.socket.sendto(segment, (self.dst_ip, self.dst_port))
-            self.seq += len(body)
             self.sendBuffer[self.seq] = body
+            self.seq += len(body)
 
-            self.asyncTraceSegment(self.seq)
-            # self.executor.submit(self.asyncTraceSegment, self.seq)
+        job = self.executor.submit(self.waitForAck)
+        job.result()
 
-    def asyncTraceSegment(self, ack: int) -> None:
-        job = self.executor.submit(self.recvIntoBuffer)
+    def waitForAck(self) -> None:
 
         while True:
-            time.sleep(0.25)
-            if ack in self.sendBuffer:
-                body = self.sendBuffer[ack]
-                self.sendSegment(ack - len(body), self.ack, body)
-                if job.done():
-                    job = self.executor.submit(self.recvIntoBuffer)
+            self.recvIntoBuffer()
+            if self.sendBuffer: # receiver did not acked every segments we sent
+
+                for k in sorted(self.sendBuffer.keys()): # resend everything in the send buffer
+                    v = self.sendBuffer[k]
+                    self.sendSegment(k, self.ack, v)
+
             else:
-                print("acked", ack)
                 break
 
-    def recvIntoBuffer(self) -> None:
-        data, addr = self.socket.recvfrom()
+    def recvIntoBuffer(self) -> None: # just receive data, update self.ack and send buffer
+        data, addr = self.socket.recvfrom() # decode segment
         header = data[: 8]
         body = data[8: ]
         seq, ack = struct.unpack(">ll", header)
-        # sender side
-        if body: # a data + ack
-            print("data segment", seq, ack, body, time.time())
-            if seq == self.ack: # in order, normal situation
-                self.receiveBuffer[seq] = body # put in buffer
-                self.ack = seq + len(body) # expecting next body
-                self.sendAck(self.seq, self.ack)
-            elif seq > self.ack: # out of order, latter comes first
-                self.receiveBuffer[seq] = body # put in buffer
 
+        # receiver side
+        if body: # contains data
+            if seq == self.ack: # normal condition, in order
+                self.receiveBuffer[seq] = body
+                self.ack = seq + len(body)
+            elif seq > self.ack: # out of order
+                self.receiveBuffer[seq] = body
+
+                # ack frontmost continuous buffer
                 seek = self.ack
-                complete = True
 
                 while seek != seq:
                     if seek in self.receiveBuffer:
                         seek += len(self.receiveBuffer[seek])
                     else:
-                        complete = False
                         break
 
-                if complete:
-                    self.ack = seq + len(body)
-                    self.sendAck(self.seq, self.ack)
-                else:
-                    print("incomplete")
-                    self.sendAck(self.seq, seek)
-            else: # seq < self.ack
-                self.sendAck(self.seq, self.ack)
-        else: # an ack
-            print("acked", seq, ack, time.time())
+                self.ack = seek
+            else: # seq < self.ack, sender sent something that we already have
+                pass
+        else: # no data, just ack
             pass
-
-        # receiver side
-        if ack == self.seq: # receiver gets all, normal situation
-            self.sendBuffer.clear()
-        elif ack < self.seq: # receiver gets partial, retransmit un-acked data
+        
+        # sender side
+        if ack == self.seq: # receiver acked all segments we sent
+            self.sendBuffer.clear() # clear send buffer
+        elif ack < self.seq: # receiver acked some segments we sent
 
             toPop = []
 
             for k, v in self.sendBuffer.items():
-                # if k - len(v) >= ack:
-                #     self.sendSegment(k - len(v), self.ack, v)
-                # else:
-                #     toPop.append(k)
-                if k <= ack:
+                if k + len(v) <= ack:
                     toPop.append(k)
-                else: # no need to retransmit here, because traceSegment() will take care of it
-                    pass
 
             for k in toPop:
-                self.sendBuffer.pop(k)
+                self.sendBuffer.pop(k) # clear segments already acked
 
-        else: # ack > self.seq not possible
-            self.sendBuffer.clear()
+        else: # ack > self.seq, receiver acked some segments we have not sent
+            pass
 
     def sendAck(self, seq: int, ack: int) -> None:
         self.sendSegment(seq, ack)
 
     def sendSegment(self, seq: int, ack: int, body: bytes=b"") -> None:
-        print("sent", seq, ack, body, time.time())
         header = struct.pack(">ll", seq, ack)
         segment = header + body
         self.socket.sendto(segment, (self.dst_ip, self.dst_port))
@@ -139,9 +123,11 @@ class Streamer:
             if self.seek in self.receiveBuffer: # if requested segment has already arrived
                 res = self.receiveBuffer.pop(self.seek)
                 self.seek += len(res)
+                self.sendAck(self.seq, self.ack)
                 break # feed body to upper layer immediately
             else: # if not arrived yet, wait
                 self.recvIntoBuffer()
+                self.sendAck(self.seq, self.ack)
 
         return res
         # For now, I'll just pass the full UDP payload to the app
@@ -150,4 +136,6 @@ class Streamer:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
+        self.sendAck(self.seq, self.ack)
+        self.socket.stoprecv()
         pass
