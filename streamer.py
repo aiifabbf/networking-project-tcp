@@ -29,7 +29,7 @@ class Streamer:
         self.pullLocalSeek = 0 # I have read until
         self.pullRemoteSeek = 0 # remote has written until
 
-        self.maxInFlightSegmentCount = 20
+        self.maxInFlightSegmentCount = 4
 
         self.lock = threading.Lock()
 
@@ -59,7 +59,7 @@ class Streamer:
     def outBoundWorker(self) -> None:
 
         while not self.closed:
-            time.sleep(0.01)
+            time.sleep(0.1) # every some time you should send something. If there is data, send data. If there is no data, send a heartbeat
 
             with self.lock:
                 if self.pushRemoteSeek < self.pushLocalSeek: # receiver did not acked every segments we sent
@@ -69,19 +69,22 @@ class Streamer:
                         if k + len(v) <= self.pushRemoteSeek:
                             self.pushBuffer.pop(k)
 
-                    # aggregate small packets into one large packet
-                    sequences = sorted(self.pushBuffer.keys())
-                    firstSequence = sequences[0]
+                    # aggregate small packets into large packets
                     data = bytearray()
 
-                    for k in sequences:
+                    for k in sorted(self.pushBuffer.keys()):
                         v = self.pushBuffer[k]
-                        if len(data) + len(v) > 1472 - 16: # can't fit in one packet
-                            break
-                        else:
-                            data.extend(v)
+                        data.extend(v)
 
-                    self.sendSegment(firstSequence, self.pullLocalSeek, data)
+                    self.pushBuffer.clear()
+
+                    for i in range(0, len(data), 1472 - 16):
+                        chunk = data[i: i + 1472 - 16]
+                        self.pushBuffer[i + self.pushRemoteSeek] = bytes(chunk)
+
+                    for k in sorted(self.pushBuffer.keys())[: self.maxInFlightSegmentCount]:
+                        v = self.pushBuffer[k]
+                        self.sendSegment(k, self.pullLocalSeek, v)
 
                 else:
                     self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
@@ -112,7 +115,7 @@ class Streamer:
             decoded = self.decodeSegment(data)
         except ValueError:
             # print("corrupted.")
-            self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
+            # self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
             self.lock.release()
             return True
 
@@ -129,7 +132,8 @@ class Streamer:
             self.pullBuffer[seq] = body
 
             if self.pullLocalSeek == self.pullRemoteSeek:
-                self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
+                # self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
+                pass
             else:
 
                 seek = self.pullLocalSeek
@@ -141,7 +145,7 @@ class Streamer:
                         seek += len(self.pullBuffer[seek])
 
                 self.pullLocalSeek = seek
-                self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
+                # self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
         else: # no data
             pass
 
