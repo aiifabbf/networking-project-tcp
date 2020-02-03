@@ -53,22 +53,35 @@ class Streamer:
             body = data_bytes[i: i + bodySize]
 
             with self.lock:
-                self.sendSegment(self.pushLocalSeek, self.pullLocalSeek, body)
-                self.pushBuffer[self.pushLocalSeek] = body
+                self.pushBuffer[self.pushLocalSeek] = body # just put the data in the send buffer
                 self.pushLocalSeek += len(body)
 
     def outBoundWorker(self) -> None:
 
         while not self.closed:
-            time.sleep(0.1)
+            time.sleep(0.01)
 
             with self.lock:
                 if self.pushRemoteSeek < self.pushLocalSeek: # receiver did not acked every segments we sent
 
-                    for k in sorted(self.pushBuffer.keys())[: self.maxInFlightSegmentCount]: # resend first 10 in the push buffer
+                    for k in sorted(self.pushBuffer.keys()): # clear segments acked by remote
                         v = self.pushBuffer[k]
-                        if k >= self.pushRemoteSeek:
-                            self.sendSegment(k, self.pullLocalSeek, v)
+                        if k + len(v) <= self.pushRemoteSeek:
+                            self.pushBuffer.pop(k)
+
+                    # aggregate small packets into one large packet
+                    sequences = sorted(self.pushBuffer.keys())
+                    firstSequence = sequences[0]
+                    data = bytearray()
+
+                    for k in sequences:
+                        v = self.pushBuffer[k]
+                        if len(data) + len(v) > 1472 - 16: # can't fit in one packet
+                            break
+                        else:
+                            data.extend(v)
+
+                    self.sendSegment(firstSequence, self.pullLocalSeek, data)
 
                 else:
                     self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
@@ -131,15 +144,6 @@ class Streamer:
                 self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
         else: # no data
             pass
-
-        toPop = []
-
-        for k, v in self.pushBuffer.items():
-            if k + len(v) <= self.pushRemoteSeek:
-                toPop.append(k)
-
-        for k in toPop:
-            self.pushBuffer.pop(k)
 
         self.lock.release()
 
@@ -217,10 +221,10 @@ class Streamer:
         self.socket.stoprecv()
         self.closed = True
 
-        # print("pull buffer size:", len(self.pullBuffer))
-        # print("push buffer size:", len(self.pushBuffer))
-        # print("---")
-        # print("pull local seek:", self.pullLocalSeek)
-        # print("pull remote seek:", self.pullRemoteSeek)
-        # print("push local seek:", self.pushLocalSeek)
-        # print("push remote seek:", self.pushRemoteSeek)
+        print("pull buffer size:", len(self.pullBuffer))
+        print("push buffer size:", len(self.pushBuffer))
+        print("---")
+        print("pull local seek:", self.pullLocalSeek)
+        print("pull remote seek:", self.pullRemoteSeek)
+        print("push local seek:", self.pushLocalSeek)
+        print("push remote seek:", self.pushRemoteSeek)
