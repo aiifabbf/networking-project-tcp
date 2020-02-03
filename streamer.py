@@ -7,6 +7,7 @@ import struct
 import threading
 import concurrent.futures
 import time
+import hashlib
 
 class Streamer:
     def __init__(self, dst_ip, dst_port,
@@ -21,14 +22,14 @@ class Streamer:
         self.seek = 0 # expect to receive body from
 
         self.pushBuffer = {} # key is sequence number, value is body bytes
-        self.pushLocalSeek = 0
-        self.pushRemoteSeek = 0
+        self.pushLocalSeek = 0 # I have written until
+        self.pushRemoteSeek = 0 # remote has read until
 
         self.pullBuffer = {} # key is sequence number, value is body bytes
-        self.pullLocalSeek = 0 # expecting body from
-        self.pullRemoteSeek = 0
+        self.pullLocalSeek = 0 # I have read until
+        self.pullRemoteSeek = 0 # remote has written until
 
-        self.pushMaxDelta = 1000
+        self.maxInFlightSegmentCount = 20
 
         self.lock = threading.Lock()
 
@@ -36,9 +37,8 @@ class Streamer:
 
         self.executor = concurrent.futures.ThreadPoolExecutor()
 
-        self.waitForAckJob = self.executor.submit(self.waitForAck)
+        self.outBoundJob = self.executor.submit(self.outBoundWorker)
         self.inBoundJob = self.executor.submit(self.inBoundWorker)
-        self.watchdogJob = self.executor.submit(self.watchdogWorker)
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
@@ -49,56 +49,34 @@ class Streamer:
         headerSize = 16
         bodySize = segmentSize - headerSize
 
-        if self.waitForAckJob.running():
-            if self.pushLocalSeek - self.pushRemoteSeek > self.pushMaxDelta:
-                self.waitForAckJob.result()
-            else:
+        for i in range(0, len(data_bytes), bodySize):
+            body = data_bytes[i: i + bodySize]
 
-                for i in range(0, len(data_bytes), bodySize):
-                    body = data_bytes[i: i + bodySize]
+            with self.lock:
+                self.sendSegment(self.pushLocalSeek, self.pullLocalSeek, body)
+                self.pushBuffer[self.pushLocalSeek] = body
+                self.pushLocalSeek += len(body)
 
-                    with self.lock:
-                        self.sendSegment(self.pushLocalSeek, self.pullLocalSeek, body)
-                        self.pushBuffer[self.pushLocalSeek] = body
-                        self.pushLocalSeek += len(body)
-
-        elif self.waitForAckJob.done():
-
-            for i in range(0, len(data_bytes), bodySize):
-                body = data_bytes[i: i + bodySize]
-
-                with self.lock:
-                    self.sendSegment(self.pushLocalSeek, self.pullLocalSeek, body)
-                    self.pushBuffer[self.pushLocalSeek] = body
-                    self.pushLocalSeek += len(body)
-
-            self.waitForAckJob = self.executor.submit(self.waitForAck)
-
-        else:
-
-            for i in range(0, len(data_bytes), bodySize):
-                body = data_bytes[i: i + bodySize]
-
-                with self.lock:
-                    self.sendSegment(self.pushLocalSeek, self.pullLocalSeek, body)
-                    self.pushBuffer[self.pushLocalSeek] = body
-                    self.pushLocalSeek += len(body)
-
-    def waitForAck(self) -> None:
+    def outBoundWorker(self) -> None:
 
         while not self.closed:
-            time.sleep(0.25)
+            time.sleep(0.1)
 
             with self.lock:
                 if self.pushRemoteSeek < self.pushLocalSeek: # receiver did not acked every segments we sent
 
-                    for k in sorted(self.pushBuffer.keys()): # resend everything in the send buffer
+                    for k in sorted(self.pushBuffer.keys())[: self.maxInFlightSegmentCount]: # resend first 10 in the push buffer
                         v = self.pushBuffer[k]
                         if k >= self.pushRemoteSeek:
                             self.sendSegment(k, self.pullLocalSeek, v)
 
                 else:
-                    break
+                    self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
+
+                # print("pull local seek:", self.pullLocalSeek)
+                # print("pull remote seek:", self.pullRemoteSeek)
+                # print("push local seek:", self.pushLocalSeek)
+                # print("push remote seek:", self.pushRemoteSeek)
 
     def inBoundWorker(self) -> None: # background worker
 
@@ -107,19 +85,6 @@ class Streamer:
                 continue
             else:
                 break
-
-    def watchdogWorker(self) -> None:
-
-        while not self.closed:
-            time.sleep(0.5)
-            self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
-
-            print("pull local seek:", self.pullLocalSeek)
-            print("pull remote seek:", self.pullRemoteSeek)
-            print("push local seek:", self.pushLocalSeek)
-            print("push remote seek:", self.pushRemoteSeek)
-            print("pull buffer size:", len(self.pullBuffer))
-            print("push buffer size:", len(self.pushBuffer))
 
     def recvIntoBuffer(self) -> bool: # just receive data, update self.ack and send buffer
         data, addr = self.socket.recvfrom() # decode segment
@@ -130,7 +95,14 @@ class Streamer:
 
         self.lock.acquire()
 
-        decoded = self.decodeSegment(data)
+        try:
+            decoded = self.decodeSegment(data)
+        except ValueError:
+            # print("corrupted.")
+            self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
+            self.lock.release()
+            return True
+
         seq = decoded["seq"]
         ack = decoded["ack"]
         control = decoded["control"]
@@ -145,7 +117,7 @@ class Streamer:
 
             if self.pullLocalSeek == self.pullRemoteSeek:
                 self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
-            elif self.pullLocalSeek < self.pullRemoteSeek:
+            else:
 
                 seek = self.pullLocalSeek
 
@@ -157,8 +129,6 @@ class Streamer:
 
                 self.pullLocalSeek = seek
                 self.sendAck(self.pushLocalSeek, self.pullLocalSeek)
-            else:
-                pass
         else: # no data
             pass
 
@@ -178,22 +148,37 @@ class Streamer:
     def sendAck(self, seq: int, ack: int) -> None:
         self.sendSegment(seq, ack)
 
-    def sendSegment(self, seq: int, ack: int, body: bytes=b"", control: bytes=b"") -> None:
-        # print("<", seq, ack, control, body)
-        control = control.rjust(8, b" ") # pad to 8 bytes
-        header = struct.pack(">ll", seq, ack) + control
+    def sendSegment(self, seq: int, ack: int, body: bytes=b"") -> None:
+        header = struct.pack(">ll", seq, ack)
         segment = header + body
+
+        hasher = hashlib.sha1()
+        hasher.update(segment)
+        checksum = hasher.digest()[: 8]
+
+        segment = header + checksum + body
+        # print("<", seq, ack, checksum, body)
         self.socket.sendto(segment, (self.dst_ip, self.dst_port))
 
     def decodeSegment(self, data: bytes=b"") -> dict:
         seqack = data[: 8]
         control = data[8: 16]
         body = data[16: ]
+
+        hasher = hashlib.sha1()
+        hasher.update(seqack)
+        hasher.update(body)
+        checksum = hasher.digest()[: 8]
+
+        if checksum != control:
+            raise ValueError("Corrupted")
+
         seq, ack = struct.unpack(">ll", seqack)
+
         return {
             "seq": seq,
             "ack": ack,
-            "control": control.strip(),
+            "control": control,
             "body": body,
         }
 
@@ -217,33 +202,25 @@ class Streamer:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
-        print("1")
+        self.lock.acquire()
+        if self.pushRemoteSeek < self.pushLocalSeek:
+            self.lock.release()
 
-        try:
-            if self.waitForAckJob.running():
-                print("2")
-                self.waitForAckJob.result(3)
-                print("3")
-            elif self.waitForAckJob.done():
-                print("4")
-                if self.pushRemoteSeek < self.pushLocalSeek:
-                    print("5")
-                    self.waitForAckJob = self.executor.submit(self.waitForAck)
-                    print("6")
-                    self.waitForAckJob.result(3)
-                    print("7")
-            else:
-                print("8")
-                self.waitForAckJob.result(3)
-                print("9")
-        except concurrent.futures.TimeoutError:
-            pass
+            try:
+                self.outBoundJob.result(3)
+            except concurrent.futures.TimeoutError:
+                pass
+
+        else:
+            self.lock.release()
 
         self.socket.stoprecv()
         self.closed = True
-        print("10")
 
-        print("pull local seek:", self.pullLocalSeek)
-        print("pull remote seek:", self.pullRemoteSeek)
-        print("push local seek:", self.pushLocalSeek)
-        print("push remote seek:", self.pushRemoteSeek)
+        # print("pull buffer size:", len(self.pullBuffer))
+        # print("push buffer size:", len(self.pushBuffer))
+        # print("---")
+        # print("pull local seek:", self.pullLocalSeek)
+        # print("pull remote seek:", self.pullRemoteSeek)
+        # print("push local seek:", self.pushLocalSeek)
+        # print("push remote seek:", self.pushRemoteSeek)
